@@ -29,6 +29,8 @@ class IndexConfig:
     enable_compression: bool = True  # Enable index compression
     cache_size: int = 1000  # LRU cache size for queries
     merge_threshold: int = 10  # Number of segments before merging
+    auto_persist: bool = True  # Automatically persist after indexing operations
+    persist_threshold: int = 1000  # Persist after N document changes
 
 
 @dataclass

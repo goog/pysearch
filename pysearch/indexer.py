@@ -59,6 +59,12 @@ class Indexer:
         # Statistics
         self.stats = IndexStats()
 
+        # Document-to-terms mapping for efficient deletion
+        self._doc_terms: Dict[int, set] = {}
+
+        # Track changes for auto-persistence
+        self._changes_since_persist = 0
+
     def index_documents(
         self,
         documents: List[Dict[str, Any]],
@@ -109,9 +115,8 @@ class Indexer:
         if elapsed > 0:
             self.stats.documents_per_second = self.stats.documents_indexed / elapsed
 
-        # Save to disk if persistence is enabled
-        if self.config.enable_compression:
-            self.storage.save()
+        # Auto-persist if configured
+        self._auto_persist()
 
         return self.stats
 
@@ -207,8 +212,12 @@ class Indexer:
                 # Add to document store
                 self.storage.doc_store.add_document(doc_id, doc)
 
+                # Track document terms for deletion
+                self._doc_terms[doc_id] = set(terms)
+
                 indexed += 1
                 self.stats.terms_indexed += len(terms)
+                self._changes_since_persist += 1
 
             except Exception as e:
                 self.stats.errors += 1
@@ -250,9 +259,16 @@ class Indexer:
             # Add to document store
             self.storage.doc_store.add_document(doc_id, document)
 
+            # Track document terms for deletion
+            self._doc_terms[doc_id] = set(terms)
+
             # Update statistics
             self.stats.documents_indexed += 1
             self.stats.terms_indexed += len(terms)
+            self._changes_since_persist += 1
+
+            # Auto-persist if threshold reached
+            self._auto_persist()
 
             return True
 
@@ -262,7 +278,7 @@ class Indexer:
 
     def remove_document(self, doc_id: int) -> bool:
         """
-        Remove a document from the index.
+        Remove a document from the index completely.
 
         Args:
             doc_id: Document ID to remove
@@ -271,15 +287,47 @@ class Indexer:
             True if successful
         """
         try:
-            # This is a simplified implementation
-            # In a production system, you'd want to track which terms
-            # are associated with each document for efficient removal
+            # Get the terms associated with this document
+            if doc_id not in self._doc_terms:
+                # Document not tracked, might need to scan or skip
+                print(f"Warning: Document {doc_id} not in term tracking. Removing from store only.")
+                self.storage.doc_store.delete_document(doc_id)
+                return True
 
-            # For now, we just remove from document store
+            terms = self._doc_terms[doc_id]
+
+            # Remove document from inverted index for each term
+            with self.storage.index._lock:
+                for term in terms:
+                    if term in self.storage.index.index:
+                        postings = self.storage.index.index[term]
+                        if doc_id in postings:
+                            # Remove document from this term's posting list
+                            del postings[doc_id]
+
+                            # If no documents left for this term, remove term entirely
+                            if not postings:
+                                del self.storage.index.index[term]
+
+                # Update document count and length tracking
+                if doc_id in self.storage.index.doc_lengths:
+                    doc_length = self.storage.index.doc_lengths[doc_id]
+                    self.storage.index.total_terms -= doc_length
+                    del self.storage.index.doc_lengths[doc_id]
+
+                self.storage.index.doc_count = max(0, self.storage.index.doc_count - 1)
+
+            # Remove from document store
             self.storage.doc_store.delete_document(doc_id)
 
-            # Note: Full removal from inverted index requires
-            # rebuilding the index or tracking document-term relationships
+            # Remove from term tracking
+            del self._doc_terms[doc_id]
+
+            # Track change
+            self._changes_since_persist += 1
+
+            # Auto-persist if threshold reached
+            self._auto_persist()
 
             return True
 
@@ -297,6 +345,9 @@ class Indexer:
         # Clear current index
         self.storage.index.clear()
 
+        # Clear document-term mapping
+        self._doc_terms.clear()
+
         # Get all documents
         documents = []
         for doc_id, doc in self.storage.doc_store.documents.items():
@@ -307,6 +358,7 @@ class Indexer:
 
         # Re-index
         self.stats = IndexStats()
+        self._changes_since_persist = 0
         return self.index_documents(documents)
 
     def get_stats(self) -> Dict[str, Any]:
@@ -317,14 +369,110 @@ class Indexer:
             'indexing_time_ms': self.stats.indexing_time_ms,
             'documents_per_second': self.stats.documents_per_second,
             'errors': self.stats.errors,
-            'is_indexing': self._is_indexing
+            'is_indexing': self._is_indexing,
+            'changes_since_persist': self._changes_since_persist
         }
+
+    def _auto_persist(self) -> bool:
+        """
+        Automatically persist index if configured and threshold reached.
+
+        Returns:
+            True if persisted, False otherwise
+        """
+        if not self.config.auto_persist:
+            return False
+
+        if self._changes_since_persist >= self.config.persist_threshold:
+            return self.persist()
+
+        return False
+
+    def persist(self) -> bool:
+        """
+        Manually persist the index to disk.
+
+        Returns:
+            True if successful
+        """
+        try:
+            # Save index and document store
+            success = self.storage.save()
+
+            if success:
+                # Save document-term mapping
+                import pickle
+                import os
+                mapping_file = os.path.join(
+                    self.storage.config.index_path,
+                    'doc_terms.pkl'
+                )
+                with open(mapping_file, 'wb') as f:
+                    pickle.dump(self._doc_terms, f)
+
+                # Reset change counter
+                self._changes_since_persist = 0
+
+            return success
+
+        except Exception as e:
+            print(f"Error persisting index: {e}")
+            return False
+
+    def load_from_disk(self) -> bool:
+        """
+        Load index from disk including document-term mappings.
+
+        Returns:
+            True if successful
+        """
+        try:
+            # Load index and document store
+            success = self.storage.load()
+
+            if success:
+                # Load document-term mapping
+                import pickle
+                import os
+                mapping_file = os.path.join(
+                    self.storage.config.index_path,
+                    'doc_terms.pkl'
+                )
+                if os.path.exists(mapping_file):
+                    with open(mapping_file, 'rb') as f:
+                        self._doc_terms = pickle.load(f)
+                else:
+                    # Rebuild mapping from existing index
+                    self._rebuild_doc_terms_mapping()
+
+                # Reset change counter
+                self._changes_since_persist = 0
+
+            return success
+
+        except Exception as e:
+            print(f"Error loading index: {e}")
+            return False
+
+    def _rebuild_doc_terms_mapping(self) -> None:
+        """
+        Rebuild document-term mapping from the inverted index.
+        This is useful when loading old indexes that don't have the mapping saved.
+        """
+        self._doc_terms.clear()
+
+        # Iterate through all terms and their postings
+        for term, postings in self.storage.index.index.items():
+            for doc_id in postings.keys():
+                if doc_id not in self._doc_terms:
+                    self._doc_terms[doc_id] = set()
+                self._doc_terms[doc_id].add(term)
 
 
 class RealTimeIndexer(Indexer):
     """
     Real-time indexer that immediately indexes documents
-    as they are added.
+    as they are added, with callback support for updates and deletions.
     """
 
     def __init__(self, *args, **kwargs):
@@ -335,7 +483,12 @@ class RealTimeIndexer(Indexer):
         self,
         callback: Callable[[int, str], None]
     ) -> None:
-        """Add callback for document updates."""
+        """
+        Add callback for document updates.
+
+        Args:
+            callback: Function(doc_id, action) where action is 'added', 'updated', or 'removed'
+        """
         self._update_callbacks.append(callback)
 
     def index_document(
@@ -345,13 +498,31 @@ class RealTimeIndexer(Indexer):
         metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         """Index document and trigger callbacks."""
+        # Check if document already exists
+        is_update = doc_id in self._doc_terms
+
         result = super().index_document(doc_id, text, metadata)
+
+        # Trigger callbacks
+        if result:
+            action = 'updated' if is_update else 'added'
+            for callback in self._update_callbacks:
+                try:
+                    callback(doc_id, action)
+                except Exception as e:
+                    print(f"Error in update callback: {e}")
+
+        return result
+
+    def remove_document(self, doc_id: int) -> bool:
+        """Remove document and trigger callbacks."""
+        result = super().remove_document(doc_id)
 
         # Trigger callbacks
         if result:
             for callback in self._update_callbacks:
                 try:
-                    callback(doc_id, 'added')
+                    callback(doc_id, 'removed')
                 except Exception as e:
                     print(f"Error in update callback: {e}")
 
