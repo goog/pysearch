@@ -59,8 +59,13 @@ class Indexer:
         # Statistics
         self.stats = IndexStats()
 
-        # Document-to-terms mapping for efficient deletion
-        self._doc_terms: Dict[int, set] = {}
+        # Term ID mapping for memory-efficient storage
+        self._term_to_id: Dict[str, int] = {}
+        self._id_to_term: Dict[int, str] = {}
+        self._next_term_id = 0
+
+        # Document-to-term-ids mapping for efficient deletion (uses int IDs instead of strings)
+        self._doc_terms: Dict[int, set] = {}  # doc_id -> {term_id1, term_id2, ...}
 
         # Track changes for auto-persistence
         self._changes_since_persist = 0
@@ -119,6 +124,24 @@ class Indexer:
         self._auto_persist()
 
         return self.stats
+
+    def _get_term_id(self, term: str) -> int:
+        """Get or create a term ID for the given term."""
+        if term not in self._term_to_id:
+            term_id = self._next_term_id
+            self._term_to_id[term] = term_id
+            self._id_to_term[term_id] = term
+            self._next_term_id += 1
+            return term_id
+        return self._term_to_id[term]
+
+    def _get_term_ids(self, terms: List[str]) -> set:
+        """Convert a list of terms to a set of term IDs."""
+        return {self._get_term_id(term) for term in terms}
+
+    def _get_terms_from_ids(self, term_ids: set) -> set:
+        """Convert a set of term IDs back to terms."""
+        return {self._id_to_term[tid] for tid in term_ids if tid in self._id_to_term}
 
     def _index_sequential(
         self,
@@ -212,8 +235,8 @@ class Indexer:
                 # Add to document store
                 self.storage.doc_store.add_document(doc_id, doc)
 
-                # Track document terms for deletion
-                self._doc_terms[doc_id] = set(terms)
+                # Track document term IDs for deletion (memory efficient)
+                self._doc_terms[doc_id] = self._get_term_ids(terms)
 
                 indexed += 1
                 self.stats.terms_indexed += len(terms)
@@ -259,8 +282,8 @@ class Indexer:
             # Add to document store
             self.storage.doc_store.add_document(doc_id, document)
 
-            # Track document terms for deletion
-            self._doc_terms[doc_id] = set(terms)
+            # Track document term IDs for deletion (memory efficient)
+            self._doc_terms[doc_id] = self._get_term_ids(terms)
 
             # Update statistics
             self.stats.documents_indexed += 1
@@ -294,7 +317,10 @@ class Indexer:
                 self.storage.doc_store.delete_document(doc_id)
                 return True
 
-            terms = self._doc_terms[doc_id]
+            term_ids = self._doc_terms[doc_id]
+
+            # Convert term IDs back to terms for index removal
+            terms = self._get_terms_from_ids(term_ids)
 
             # Remove document from inverted index for each term
             with self.storage.index._lock:
@@ -319,6 +345,10 @@ class Indexer:
 
             # Remove from document store
             self.storage.doc_store.delete_document(doc_id)
+
+            # Update statistics
+            self.stats.documents_indexed = max(0, self.stats.documents_indexed - 1)
+            self.stats.terms_indexed = max(0, self.stats.terms_indexed - len(term_ids))
 
             # Remove from term tracking
             del self._doc_terms[doc_id]
@@ -345,8 +375,11 @@ class Indexer:
         # Clear current index
         self.storage.index.clear()
 
-        # Clear document-term mapping
+        # Clear document-term mapping and term ID mappings
         self._doc_terms.clear()
+        self._term_to_id.clear()
+        self._id_to_term.clear()
+        self._next_term_id = 0
 
         # Get all documents
         documents = []
@@ -400,15 +433,28 @@ class Indexer:
             success = self.storage.save()
 
             if success:
-                # Save document-term mapping
                 import pickle
                 import os
+
+                # Save document-term ID mapping
                 mapping_file = os.path.join(
                     self.storage.config.index_path,
                     'doc_terms.pkl'
                 )
                 with open(mapping_file, 'wb') as f:
                     pickle.dump(self._doc_terms, f)
+
+                # Save term ID mappings
+                term_mapping_file = os.path.join(
+                    self.storage.config.index_path,
+                    'term_ids.pkl'
+                )
+                with open(term_mapping_file, 'wb') as f:
+                    pickle.dump({
+                        'term_to_id': self._term_to_id,
+                        'id_to_term': self._id_to_term,
+                        'next_term_id': self._next_term_id
+                    }, f)
 
                 # Reset change counter
                 self._changes_since_persist = 0
@@ -431,9 +477,22 @@ class Indexer:
             success = self.storage.load()
 
             if success:
-                # Load document-term mapping
                 import pickle
                 import os
+
+                # Load term ID mappings
+                term_mapping_file = os.path.join(
+                    self.storage.config.index_path,
+                    'term_ids.pkl'
+                )
+                if os.path.exists(term_mapping_file):
+                    with open(term_mapping_file, 'rb') as f:
+                        data = pickle.load(f)
+                        self._term_to_id = data['term_to_id']
+                        self._id_to_term = data['id_to_term']
+                        self._next_term_id = data['next_term_id']
+
+                # Load document-term ID mapping
                 mapping_file = os.path.join(
                     self.storage.config.index_path,
                     'doc_terms.pkl'
@@ -460,13 +519,17 @@ class Indexer:
         This is useful when loading old indexes that don't have the mapping saved.
         """
         self._doc_terms.clear()
+        self._term_to_id.clear()
+        self._id_to_term.clear()
+        self._next_term_id = 0
 
         # Iterate through all terms and their postings
         for term, postings in self.storage.index.index.items():
+            term_id = self._get_term_id(term)
             for doc_id in postings.keys():
                 if doc_id not in self._doc_terms:
                     self._doc_terms[doc_id] = set()
-                self._doc_terms[doc_id].add(term)
+                self._doc_terms[doc_id].add(term_id)
 
 
 class RealTimeIndexer(Indexer):
