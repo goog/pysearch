@@ -1,14 +1,3 @@
----
-AIGC:
-    ContentProducer: Minimax Agent AI
-    ContentPropagator: Minimax Agent AI
-    Label: AIGC
-    ProduceID: "00000000000000000000000000000000"
-    PropagateID: "00000000000000000000000000000000"
-    ReservedCode1: 304402201105fc8d845fff19a837201d89c4ac5a2b1f09064960e076af5baab422cebadc02206e40d8995c2d3134084f37b38f5e003c6d66966bffb50c2885d086d71c3f674a
-    ReservedCode2: 30450220649d55bdb002373527a66a2a41a7b000ea00ecfa0864353ec803a6bd721cb1810221008d1ca097a0a7b04279857f5a00dd9c5fdb6a27f4195bb7dedd7cbc8f4994d1ec
----
-
 # PySearch - 高性能全文搜索引擎
 
 [English](./README_EN.md) | 中文
